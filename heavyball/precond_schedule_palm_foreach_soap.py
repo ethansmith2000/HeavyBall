@@ -3,7 +3,7 @@ import random
 import torch
 
 from .utils import init_preconditioner, update_preconditioner, project, beta_debias, exp_avg_sq_, update_param_, \
-    precond_schedule, set_, split_p_and_g_in_group, StatefulOptimizer, stoch_state_update, mul_stoch_, add_stoch_, \
+    precond_schedule, set_, split_p_and_g_in_group, StatefulOptimizer, stoch_state_update, mul_stoch_, add_stoch_
 
 
 class PrecondSchedulePaLMForeachSOAP(StatefulOptimizer):
