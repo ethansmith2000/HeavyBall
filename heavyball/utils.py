@@ -12,6 +12,7 @@ from torch.utils._pytree import tree_map
 
 compile_mode = None
 zeroth_power_mode = 'qr'  # 'qr' is baseline, 'newtonschulz' converges better and faster, 'eigh' is perfect but slow
+stoch_state_update = False  # stochastic state update
 
 
 def decorator(func):
@@ -60,6 +61,60 @@ def schedule_free_(lr: float, weight_lr_power: float, weight_sum: float, beta1: 
     torch._foreach_sub_(z, grad, alpha=lr)
     copy_stochastic_list_(z, z32)
     return weight_sum
+
+
+def promote_or_promote_list(x):
+    if isinstance(x, list):
+        return [promote(a) for a in x]
+    return promote(x)
+
+
+def two_arg_stoch_(fn, for_each_fn, x, y, **kwargs):
+    if isinstance(x, torch.Tensor):
+        x32 = promote(x)
+        getattr(x32, fn)(promote(y), **kwargs)
+        copy_stochastic_(x, x32)
+    else:
+        x32 = [promote(a) for a in x]
+        y32 = [promote(a) for a in y]
+        for_each_fn(x32, y32, **kwargs)
+        copy_stochastic_list_(x, x32)
+
+def three_arg_stoch_(fn, for_each_fn, x, y, z, **kwargs):
+    if isinstance(x, torch.Tensor):
+        x32 = promote(x)
+        getattr(x32, fn)(promote(y), promote(z), **kwargs)
+        copy_stochastic_(x, x32)
+    else:
+        x32 = [promote(a) for a in x]
+        y32 = [promote(a) for a in y]
+        # check if z[0] and y[0] are the same
+        if z[0].data_ptr() == y[0].data_ptr():
+            for_each_fn(x32, y32, y32, **kwargs)
+        else:
+            z32 = [promote(a) for a in z]
+            for_each_fn(x32, y32, z32, **kwargs)
+        copy_stochastic_list_(x, x32)
+
+
+# stochastic ops
+def mul_stoch_(x, y):
+    two_arg_stoch_('mul_', torch._foreach_mul_, x, y)
+
+def div_stoch_(x, y):
+    two_arg_stoch_('div_', torch._foreach_div_, x, y)
+
+def lerp_stoch_(x, y, weight=1):
+    two_arg_stoch_('lerp_', torch._foreach_lerp_, x, y, weight=weight)
+
+def addcmul_stoch_(x, y, z, value=1):
+    three_arg_stoch_('addcmul_', torch._foreach_addcmul_, x, y, z, value=value)
+
+def addcdiv_stoch_(x, y, z, value=1):
+    three_arg_stoch_('addcdiv_', torch._foreach_addcdiv_, x, y, z, value=value)
+
+def add_stoch_(x, y, alpha=1):
+    two_arg_stoch_('add_', torch._foreach_add_, x, y, alpha=alpha)
 
 
 def append_or_extend(base, new):
@@ -125,14 +180,24 @@ def beta_debias(beta, step):
 
 def exp_avg_sq_(state, grad, beta2, eps, out=None):
     if isinstance(state, torch.Tensor):
-        state.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+        if stoch_state_update:
+            mul_stoch_(state, beta2)
+            addcmul_stoch_(state, grad, grad, value=1 - beta2)
+        else:
+            state.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
         return torch.sqrt(state, out=out).clamp_(min=eps)
 
-    torch._foreach_mul_(state, beta2)
-    torch._foreach_addcmul_(state, grad, grad, value=1 - beta2)
+    if stoch_state_update:
+        mul_stoch_(state, beta2)
+        addcmul_stoch_(state, grad, grad, value=1 - beta2)
+    else:
+        torch._foreach_mul_(state, beta2)
+        torch._foreach_addcmul_(state, grad, grad, value=1 - beta2)
+
     denom = torch._foreach_sqrt(state)
     torch._foreach_maximum_(denom, eps)
     return denom
+
 
 
 def adaptive_gradient_clipping_(parameters: List[torch.Tensor], gradients: List[torch.Tensor], clip_val: float,
@@ -314,21 +379,30 @@ def compute_ggt(grad, GG, max_precond_dim, precondition_1d, beta):
     if grad.dim() == 1 and (not precondition_1d or grad.shape[0] > max_precond_dim):
         return
 
+
+
     for idx, sh in enumerate(grad.shape):
         if sh > max_precond_dim:
             continue
         b = _einsum_base[idx]
         g0 = _einsum_base[:grad.dim()]
         g1 = g0.replace(b, b.upper())
-        outer_product = torch.einsum(f'{g0},{g1}->{b + b.upper()}', grad, grad)
-        GG[idx].lerp_(promote(outer_product), 1 - beta)
+        if stoch_state_update:
+            outer_product = torch.einsum(f'{g0},{g1}->{b + b.upper()}', promote(grad), promote(grad))
+            GG32_idx = promote(GG[idx])
+            GG32_idx.lerp_(outer_product, 1 - beta)
+            copy_stochastic_(GG[idx], GG32_idx)
+        else:
+            outer_product = torch.einsum(f'{g0},{g1}->{b + b.upper()}', grad, grad)
+            GG[idx].lerp_(promote(outer_product), 1 - beta)
 
 
 def promote(x):
     if x is (torch.bfloat16, torch.float16):
         return torch.float32
-    if x.dtype in (torch.bfloat16, torch.float16):
-        return x.float()
+    if hasattr(x, 'dtype'):
+        if x.dtype in (torch.bfloat16, torch.float16):
+            return x.float()
     return x
 
 
@@ -378,7 +452,10 @@ def project(grad, Q, back: bool):
     preconditioners = ",".join([(g + g.upper())[::-1 if back else 1] for m, g in zip(Q, param) if len(m) > 0])
     if preconditioners:
         out = ''.join([c.upper() if c.upper() in preconditioners else c for c in param])
-        grad = torch.einsum(f'{param},{preconditioners}->{out}', grad, *[q for q in Q if len(q) > 0])
+        if stoch_state_update:
+            grad = torch.einsum(f'{param},{preconditioners}->{out}', promote(grad), *[promote(q) for q in Q if len(q) > 0])
+        else:
+            grad = torch.einsum(f'{param},{preconditioners}->{out}', grad, *[q for q in Q if len(q) > 0])
     return grad
 
 
@@ -563,10 +640,19 @@ def init_Q_exprs(t, scale, max_size, min_ndim_triangular, memory_save_mode, dtyp
 
 @decorator
 def psgd_balance_Q(Q_in):
-    norms = torch.stack([q.norm(float("inf")) for q in Q_in])
-    geometric_mean = norms.log().mean().exp()
-    norms = geometric_mean / norms
-    torch._foreach_mul_(Q_in, list(norms))
+    if stoch_state_update:
+        Q_in_32 = [promote(q) for q in Q_in]
+        # norms = torch._foreach_norm(Q_in_32, float("inf"))
+        norms = torch.stack([q.norm(float("inf")) for q in Q_in_32])
+        geometric_mean = norms.log().mean().exp()
+        norms = geometric_mean / norms
+        torch._foreach_mul_(Q_in_32, list(norms))
+        copy_stochastic_list_(Q_in, Q_in_32)
+    else:
+        norms = torch.stack([q.norm(float("inf")) for q in Q_in])
+        geometric_mean = norms.log().mean().exp()
+        norms = geometric_mean / norms
+        torch._foreach_mul_(Q_in, list(norms))
 
 
 def psgd_calc_A_and_conjB(exprA, G, Q, V):
@@ -615,7 +701,16 @@ def psgd_update_precond(Q, exprs, V, G, step, tiny):
 
     A, conjB = psgd_calc_A_and_conjB(exprA, G, Q, V)
 
+    if stoch_state_update:
+        A = promote(A)
+        conjB = promote(conjB)
+
     for q, exprG in zip(Q, exprGs):
+        if stoch_state_update:
+            q_ = promote(q)
+        else:
+            q_ = q
+
         term1 = torch.einsum(exprG, A, A.conj())
         term2 = torch.einsum(exprG, conjB.conj(), conjB)
 
@@ -625,23 +720,34 @@ def psgd_update_precond(Q, exprs, V, G, step, tiny):
 
         term1 *= step
         norm = term2.norm(float('inf'))
-        if q.dim() < 2:
-            term1 *= q
-            q.addcdiv_(term1, norm.clamp_(min=tiny), value=-1)
+        if q_.dim() < 2:
+            term1 *= q_
+            q_.addcdiv_(term1, norm.clamp_(min=tiny), value=-1)
         else:
             torch.triu(term1, out=term1)
             term1 /= torch.where(norm > 0, psgd_lb(term2, norm), norm).clamp_(tiny)
-            q.addmm_(term1, q, alpha=-1)
+            q_.addmm_(term1, q, alpha=-1)
+
+        if stoch_state_update:
+            copy_stochastic_(q, q_)
 
 
 @decorator
 def psgd_precond_grad(Q, exprs, G, inplace: bool = False):
     """Precondition gradient G with preconditioner Q."""
-    out = torch.einsum(exprs[-1], *[q.conj() for q in Q], *Q, G)
-    if inplace:
-        set_(G, out)
-        return G
-    return out
+    if stoch_state_update:
+        out32 = torch.einsum(exprs[-1], *[promote(q).conj() for q in Q], *[promote(q) for q in Q], promote(G))
+        if inplace:
+            copy_stochastic_(G, out32)
+            return G
+        return out32
+
+    else:
+        out = torch.einsum(exprs[-1], *[q.conj() for q in Q], *Q, G)
+        if inplace:
+            set_(G, out)
+            return G
+        return out
 
 
 def norm_clip_(x, scale=None):

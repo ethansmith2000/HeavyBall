@@ -3,7 +3,8 @@ import random
 import torch
 
 from .utils import init_preconditioner, update_preconditioner, project, set_, adaptive_gradient_clipping_, \
-    exp_avg_sq_, beta_debias, schedule_free_, warmup, ScheduleFree, split_p_and_g_in_group
+    exp_avg_sq_, beta_debias, schedule_free_, warmup, ScheduleFree, split_p_and_g_in_group, \
+    stoch_state_update, div_stoch_, add_stoch_
 
 
 class SFPaLMForeachSOAP(ScheduleFree):
@@ -105,7 +106,10 @@ class SFPaLMForeachSOAP(ScheduleFree):
             # Decay the first and second moment running average coefficient
             # In-place operations to update the averages at the same time
             denom = exp_avg_sq_(exp_avg_sq, grad, new_debiased2, group["eps"])
-            torch._foreach_div_(grad_projected, denom)
+            if stoch_state_update:
+                div_stoch_(grad_projected, denom)
+            else:
+                torch._foreach_div_(grad_projected, denom)
 
             update_precond = group['step'] > 0 and group['step'] % group['precondition_frequency'] == 0
 
@@ -121,7 +125,10 @@ class SFPaLMForeachSOAP(ScheduleFree):
 
             # Weight decay calculated at y
             if group["weight_decay"] > 0:
-                torch._foreach_add_(grad, p_list, alpha=group["weight_decay"])
+                if stoch_state_update:
+                    add_stoch_(grad, p_list, alpha=group["weight_decay"])
+                else:
+                    torch._foreach_add_(grad, p_list, alpha=group["weight_decay"])
 
             lr = warmup(group['lr'], step, group['warmup_steps'])
             group['weight_sum'] = schedule_free_(lr, group['weight_lr_power'], group['weight_sum'], group['beta'],

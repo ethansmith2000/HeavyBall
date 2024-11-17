@@ -1,7 +1,7 @@
 import torch
 import torch.optim
 
-from .utils import warmup, exp_avg_sq_, beta_debias, update_param_, StatefulOptimizer
+from .utils import warmup, exp_avg_sq_, beta_debias, update_param_, StatefulOptimizer, stoch_state_update, mul_stoch_, addcdiv_stoch_
 
 
 class ForeachLaProp(StatefulOptimizer):
@@ -44,8 +44,12 @@ class ForeachLaProp(StatefulOptimizer):
             # Decay the first and second moment running average coefficient
             denom = exp_avg_sq_(exp_avg_sq, grad, beta_debias(group['betas'][1], k + 1), eps)
             beta1 = beta_debias(group['betas'][0], k + 1)
-            torch._foreach_mul_(exp_avg, beta1)
-            torch._foreach_addcdiv_(exp_avg, grad, denom, 1 - beta1)
+            if stoch_state_update:
+                mul_stoch_(exp_avg, beta1)
+                addcdiv_stoch_(exp_avg, grad, denom, 1 - beta1)
+            else:
+                torch._foreach_mul_(exp_avg, beta1)
+                torch._foreach_addcdiv_(exp_avg, grad, denom, 1 - beta1)
             del grad
 
             # Normalize grad in-place for memory efficiency

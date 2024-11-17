@@ -1,7 +1,7 @@
 import torch
 import torch.optim
 
-from .utils import warmup, beta_debias, update_param_, StatefulOptimizer
+from .utils import warmup, beta_debias, update_param_, StatefulOptimizer, stoch_state_update, mul_stoch_, addcdiv_stoch_, addcmul_stoch_
 
 
 class ForeachADOPT(StatefulOptimizer):
@@ -49,12 +49,20 @@ class ForeachADOPT(StatefulOptimizer):
                 beta1 = beta_debias(group['betas'][0], k)
                 denom = torch._foreach_sqrt(exp_avg_sq)
                 torch._foreach_maximum_(denom, eps)
-                torch._foreach_mul_(exp_avg, beta1)
-                torch._foreach_addcdiv_(exp_avg, grad, denom, 1 - beta1)
+                if stoch_state_update:
+                    mul_stoch_(exp_avg, beta1)
+                    addcdiv_stoch_(exp_avg, grad, denom, 1 - beta1)
+                else:
+                    torch._foreach_mul_(exp_avg, beta1)
+                    torch._foreach_addcdiv_(exp_avg, grad, denom, 1 - beta1)
 
             beta2 = beta_debias(group['betas'][1], k + 1)
-            torch._foreach_mul_(exp_avg_sq, beta2)
-            torch._foreach_addcmul_(exp_avg_sq, grad, grad, value=1 - beta2)
+            if stoch_state_update:
+                mul_stoch_(exp_avg_sq, beta2)
+                addcmul_stoch_(exp_avg_sq, grad, grad, value=1 - beta2)
+            else:
+                torch._foreach_mul_(exp_avg_sq, beta2)
+                torch._foreach_addcmul_(exp_avg_sq, grad, grad, value=1 - beta2)
             del grad
 
             group['k'] = k + 1

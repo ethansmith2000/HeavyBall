@@ -8,7 +8,7 @@ import torch
 
 from heavyball.utils import copy_stochastic_list_
 from .utils import update_param_, warmup, psgd_precond_grad, init_Q_exprs, trust_region_clip_, PSGDBase, \
-    precond_update_prob_schedule, split_p_and_g_in_group, triu_to_line, line_to_triu, set_
+    precond_update_prob_schedule, split_p_and_g_in_group, triu_to_line, line_to_triu, set_, lerp_stoch_, stoch_state_update
 
 
 class ForeachDelayedPSGD(PSGDBase):
@@ -109,7 +109,10 @@ class ForeachDelayedPSGD(PSGDBase):
 
             group["step"] += 1
 
-            torch._foreach_lerp_(exp_avg_list, grad_list, (1 - beta) / (1 - beta ** group["step"]))
+            if stoch_state_update:
+                lerp_stoch_(exp_avg_list, grad_list, (1 - beta) / (1 - beta ** group["step"]))
+            else:
+                torch._foreach_lerp_(exp_avg_list, grad_list, (1 - beta) / (1 - beta ** group["step"]))
 
             Q_list, exp_avg_list = list(Q_list), list(exp_avg_list)
             for i, (p, g) in enumerate(zip(p_list, grad_list)):

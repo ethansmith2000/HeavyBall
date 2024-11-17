@@ -1,7 +1,7 @@
 import torch
 import torch.optim
 
-from .utils import schedule_free_, warmup, ScheduleFree, exp_avg_sq_, beta_debias
+from .utils import schedule_free_, warmup, ScheduleFree, exp_avg_sq_, beta_debias, div_stoch_, stoch_state_update
 
 
 class ForeachSFAdamW(ScheduleFree):
@@ -50,9 +50,13 @@ class ForeachSFAdamW(ScheduleFree):
             denom = exp_avg_sq_(exp_avg_sq, grad, old_debiased, eps)
 
             # Normalize grad in-place for memory efficiency
-            torch._foreach_div_(grad, denom)
+            if stoch_state_update:
+                torch._foreach_div_(grad, denom)
+            else:
+                div_stoch_(grad, denom)
 
             # Weight decay calculated at y
+            #TODO need stoch update on the grad?
             if decay != 0:
                 torch._foreach_add_(grad, y, alpha=decay)
 

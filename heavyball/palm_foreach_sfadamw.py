@@ -1,7 +1,7 @@
 import torch
 import torch.optim
 
-from .utils import schedule_free_, warmup, ScheduleFree, exp_avg_sq_, beta_debias
+from .utils import schedule_free_, warmup, ScheduleFree, exp_avg_sq_, beta_debias, stoch_state_update, div_stoch_, add_stoch_
 
 
 class PaLMForeachSFAdamW(ScheduleFree):
@@ -52,11 +52,17 @@ class PaLMForeachSFAdamW(ScheduleFree):
             denom = exp_avg_sq_(exp_avg_sq, grad, old_debiased, eps)
 
             # Normalize grad in-place for memory efficiency
-            torch._foreach_div_(grad, denom)
+            if stoch_state_update:
+                div_stoch_(grad, denom)
+            else:
+                torch._foreach_div_(grad, denom)
 
             # Weight decay calculated at y
             if decay != 0:
-                torch._foreach_add_(grad, y, alpha=decay)
+                if stoch_state_update:
+                    add_stoch_(grad, y, alpha=decay)
+                else:
+                    torch._foreach_add_(grad, y, alpha=decay)
 
             lr = warmup(group['lr'], k + 1, group['warmup_steps'])
             group['weight_sum'] = schedule_free_(lr, group['weight_lr_power'], group['weight_sum'], group['beta'],
