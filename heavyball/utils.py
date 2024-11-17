@@ -97,24 +97,50 @@ def three_arg_stoch_(fn, for_each_fn, x, y, z, **kwargs):
         copy_stochastic_list_(x, x32)
 
 
+def det_op_(fn, for_each_fn, *args, **kwargs):
+    # is this a bad pattern to assume first arg is the thing to add to
+    if isinstance(args[0], torch.Tensor):
+        getattr(args[0], fn)(*args[1:], **kwargs)
+    else:
+        for_each_fn(*args, **kwargs)
+
 # stochastic ops
-def mul_stoch_(x, y):
-    two_arg_stoch_('mul_', torch._foreach_mul_, x, y)
+def mul_(x, y):
+    if stoch_state_update:
+        two_arg_stoch_('mul_', torch._foreach_mul_, x, y)
+    else:
+        det_op_('mul_', torch._foreach_mul_, x, y)
 
-def div_stoch_(x, y):
-    two_arg_stoch_('div_', torch._foreach_div_, x, y)
 
-def lerp_stoch_(x, y, weight=1):
-    two_arg_stoch_('lerp_', torch._foreach_lerp_, x, y, weight=weight)
+def div_(x, y):
+    if stoch_state_update:
+        two_arg_stoch_('div_', torch._foreach_div_, x, y)
+    else:
+        det_op_('div_', torch._foreach_div_, x, y)
 
-def addcmul_stoch_(x, y, z, value=1):
-    three_arg_stoch_('addcmul_', torch._foreach_addcmul_, x, y, z, value=value)
+def lerp_(x, y, weight=1):
+    if stoch_state_update:
+        two_arg_stoch_('lerp_', torch._foreach_lerp_, x, y, weight=weight)
+    else:
+        det_op_('lerp_', torch._foreach_lerp_, x, y, weight=weight)
 
-def addcdiv_stoch_(x, y, z, value=1):
-    three_arg_stoch_('addcdiv_', torch._foreach_addcdiv_, x, y, z, value=value)
+def addcmul_(x, y, z, value=1):
+    if stoch_state_update:
+        three_arg_stoch_('addcmul_', torch._foreach_addcmul_, x, y, z, value=value)
+    else:
+        det_op_('addcmul_', torch._foreach_addcmul_, x, y, z, value=value)
 
-def add_stoch_(x, y, alpha=1):
-    two_arg_stoch_('add_', torch._foreach_add_, x, y, alpha=alpha)
+def addcdiv_(x, y, z, value=1):
+    if stoch_state_update:
+        three_arg_stoch_('addcdiv_', torch._foreach_addcdiv_, x, y, z, value=value)
+    else:
+        det_op_('addcdiv_', torch._foreach_addcdiv_, x, y, z, value=value)
+
+def add_(x, y, alpha=1):
+    if stoch_state_update:
+        two_arg_stoch_('add_', torch._foreach_add_, x, y, alpha=alpha)
+    else:
+        det_op_('add_', torch._foreach_add_, x, y, alpha=alpha)
 
 
 def append_or_extend(base, new):

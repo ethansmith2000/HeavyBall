@@ -1,7 +1,7 @@
 import torch
 
 from .utils import init_preconditioner, update_preconditioner, project, beta_debias, exp_avg_sq_, update_param_, set_, \
-    split_p_and_g_in_group, StatefulOptimizer, stoch_state_update, mul_stoch_, add_stoch_
+    split_p_and_g_in_group, StatefulOptimizer, mul_, add_
 
 
 class ForeachSOAP(StatefulOptimizer):
@@ -82,12 +82,8 @@ class ForeachSOAP(StatefulOptimizer):
 
             # Decay the first and second moment running average coefficient
             # In-place operations to update the averages at the same time
-            if stoch_state_update:
-                mul_stoch_(exp_avg, old_debiased1)
-                add_stoch_(exp_avg, grad, alpha=1 - old_debiased1)
-            else:
-                torch._foreach_mul_(exp_avg, old_debiased1)
-                torch._foreach_add_(exp_avg, grad, alpha=1 - old_debiased1)
+            mul_(exp_avg, old_debiased1)
+            add_(exp_avg_sq, grad_projected, alpha=1 - old_debiased2)
             denom = exp_avg_sq_(exp_avg_sq, grad_projected, old_debiased2, group['eps'])
 
             for p, g, ea, d in zip(p_list, grad, exp_avg, denom):

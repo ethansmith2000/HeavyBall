@@ -7,7 +7,7 @@ Source available at https://github.com/evanatyourservice/kron_torch/blob/97a2b5e
 import torch
 
 from .utils import update_param_, warmup, psgd_precond_grad, init_Q_exprs, PSGDBase, precond_update_prob_schedule, \
-    exp_avg_sq_, beta_debias, split_p_and_g_in_group, lerp_stoch_, stoch_state_update, promote, copy_stochastic_
+    exp_avg_sq_, beta_debias, split_p_and_g_in_group, lerp_, promote, copy_stochastic_
 
 
 class ForeachPaLMPAdam(PSGDBase):
@@ -110,10 +110,7 @@ class ForeachPaLMPAdam(PSGDBase):
             if do_update:
                 self.do_update(p_list, grad_list, Q_list, precond_lr)
 
-            if stoch_state_update:
-                lerp_stoch_(exp_avg, grad_list, 1 - beta_debias(group['beta'], group['step']))
-            else:
-                torch._foreach_lerp_(exp_avg, grad_list, 1 - beta_debias(group['beta'], group['step']))
+            lerp_(exp_avg, grad_list, 1 - beta_debias(group['beta'], group['step']))
 
             beta2 = 1 - group['step'] ** -group['beta2_scale']
 
@@ -121,6 +118,7 @@ class ForeachPaLMPAdam(PSGDBase):
                 psgd_precond_grad(Q, self.state_(p)["exprs"], g, inplace=True)
                 ea = psgd_precond_grad(Q, self.state_(p)["exprs"], ea)
                 exp_avg_sq_(eas, g, beta_debias(beta2, group['step']), 1e-8, out=g)
+                # exception here because we use out kwarg
                 if stoch_state_update:
                     ea32 = promote(ea)
                     g32 = promote(g)

@@ -1,7 +1,7 @@
 import torch
 import torch.optim
 
-from .utils import warmup, exp_avg_sq_, beta_debias, update_param_, StatefulOptimizer
+from .utils import warmup, exp_avg_sq_, beta_debias, update_param_, StatefulOptimizer, lerp_
 
 
 class ForeachAdamW(StatefulOptimizer):
@@ -41,7 +41,7 @@ class ForeachAdamW(StatefulOptimizer):
                 *[(p.data, p.grad.float(), self.state_(p)['exp_avg_sq'], self.state_(p)['exp_avg']) for p in active_p])
 
             # Decay the first and second moment running average coefficient
-            torch._foreach_lerp_(exp_avg, grad, 1 - beta_debias(group['betas'][0], k + 1))
+            lerp_(exp_avg, grad, 1 - beta_debias(group['betas'][0], k + 1))
             denom = exp_avg_sq_(exp_avg_sq, grad, beta_debias(group['betas'][1], k + 1), eps)
 
             # Normalize grad in-place for memory efficiency

@@ -8,8 +8,7 @@ import torch
 from typing import Optional
 
 from .utils import update_param_, warmup, psgd_precond_grad, init_Q_exprs, trust_region_clip_, PSGDBase, \
-    precond_update_prob_schedule, split_p_and_g_in_group, line_to_triu, triu_to_line, set_, \
-    stoch_state_update, lerp_stoch_
+    precond_update_prob_schedule, split_p_and_g_in_group, line_to_triu, triu_to_line, set_, lerp_
 
 
 class ForeachPSGDKron(PSGDBase):
@@ -109,10 +108,7 @@ class ForeachPSGDKron(PSGDBase):
 
             group["step"] += 1
 
-            if stoch_state_update:
-                lerp_stoch_(exp_avg_list, grad_list, (1 - beta) / (1 - beta ** group["step"]))
-            else:
-                torch._foreach_lerp_(exp_avg_list, grad_list, (1 - beta) / (1 - beta ** group["step"]))
+            lerp_(exp_avg_list, grad_list, (1 - beta) / (1 - beta ** group["step"]))
 
             grad_list, Q_list, exp_avg_list = list(grad_list), list(Q_list), list(exp_avg_list)
             for i, (p, g) in enumerate(zip(p_list, grad_list)):
