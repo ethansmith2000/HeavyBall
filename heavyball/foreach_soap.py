@@ -64,7 +64,8 @@ class ForeachSOAP(StatefulOptimizer):
         p_list, grad, grad_projected, exp_avg, exp_avg_sq = zip(*vals)
         beta1, beta2 = group["betas"]
 
-        old_debiased2 = beta_debias(beta2, step)
+        # TEMPORARY FIX BECAUSE DIVIDIN BY ZERO HERE
+        old_debiased2 = beta_debias(beta2, step+1)
 
         # Decay the first and second moment running average coefficient
         # In-place operations to update the averages at the same time

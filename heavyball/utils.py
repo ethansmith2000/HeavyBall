@@ -10,8 +10,57 @@ import torch
 from torch.backends import cudnn, opt_einsum
 from torch.utils._pytree import tree_map
 
+from torch.distributed.tensor import distribute_tensor, DTensor
+
 compile_mode = None
 zeroth_power_mode = 'qr'  # 'qr' is baseline, 'newtonschulz' converges better and faster, 'eigh' is perfect but slow
+
+
+def convert_local(x, keep_sharded=False):
+    if isinstance(x, DTensor):
+        if keep_sharded:
+            return x.to_local()
+        else:
+            return x.full_tensor()
+    return x
+
+def local_op(fn, *args, keep_sharded=False, **kwargs):
+    device_mesh = args[0].device_mesh
+    placements = args[0].placements
+    shape = args[0].shape
+    stride = args[0].stride()
+
+    args = [convert_local(x, keep_sharded) for x in args]
+    kwargs = {k: convert_local(v, keep_sharded) for k, v in kwargs.items()}
+
+    result = fn(*args, **kwargs)
+
+    result = DTensor.from_local(result, device_mesh=device_mesh, placements=placements, shape=shape, stride=stride)
+
+    return result
+
+def to_local(x, keep_sharded=False):
+    meta = dict(
+        device_mesh=x.device_mesh,
+        placements=x.placements,
+        shape=x.shape,
+        stride=x.stride(),
+    )
+    x = convert_local(x, keep_sharded)
+
+    return x, meta
+
+def to_dist(x, meta):
+    return DTensor.from_local(x, **meta)
+
+
+
+def local_op_(*args, **kwargs):
+    """
+    in place version
+    """
+    pass
+
 
 
 def decorator(func):
@@ -141,7 +190,8 @@ def beta_debias(beta, step):
     return 1 - (1 - beta) / (1 - beta ** step)
 
 
-@torch.compile(mode='max-autotune-no-cudagraphs', fullgraph=True, dynamic=True)
+# DISABLING FOR FSDP
+# @torch.compile(mode='max-autotune-no-cudagraphs', fullgraph=True, dynamic=True)
 def exp_avg_sq_(state, grad, beta2, eps, out=None):
     if isinstance(state, torch.Tensor):
         state.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
@@ -150,6 +200,7 @@ def exp_avg_sq_(state, grad, beta2, eps, out=None):
     torch._foreach_mul_(state, beta2)
     [s.addcmul_(g, g, value=1 - beta2) for s, g in zip(state, grad)]
     denom = torch._foreach_sqrt(state)
+    torch.distributed.breakpoint(0)
     torch._foreach_maximum_(denom, eps)
     return denom
 
@@ -225,7 +276,12 @@ def zeropower_via_newtonschulz5(G, init, steps=2, eps=1e-7):
 
 def ortho(x):
     if zeroth_power_mode == 'qr':
-        return torch.linalg.qr(x).Q
+        if isinstance(x, DTensor):
+            x, meta = to_local(x, keep_sharded=False)
+            q = torch.linalg.qr(x).Q
+            return DTensor.from_local(q, device_mesh=meta['device_mesh'], placements=meta['placements'])
+        else:
+            return torch.linalg.qr(x).Q
     if zeroth_power_mode == 'svd':
         u, s, v = torch.linalg.svd(x)
         return u @ v.T
@@ -258,25 +314,53 @@ def get_orthogonal_matrix_QR(GG, Q, exp_avg_sq):
             indices.append(None)
             continue
 
-        tmp = m @ o
-        est_eig = torch.einsum('ij,ij->j', o, tmp)
+        # lets just fully go local here
+        if isinstance(q, DTensor):
+            q_local, meta = to_local(q, keep_sharded=False)
+            m_local, meta = to_local(m, keep_sharded=False)
+            o_local, meta = to_local(o, keep_sharded=False)
+        else:
+            q_local = q
+            m_local = m
+            o_local = o
+
+
+        tmp = m_local @ o_local
+        est_eig = torch.einsum('ij,ij->j', o_local, tmp)
         sort_idx = torch.argsort(est_eig, descending=True)
         indices.append(sort_idx)
         if zeroth_power_mode == 'eigh':
-            set_(q, torch.linalg.eigh(m)[1])
+            set_(q_local, torch.linalg.eigh(m)[1])
         elif zeroth_power_mode.startswith('newtonschulz'):
             iterations = zeroth_power_mode[len('newtonschulz'):]
             if iterations == '':
                 iterations = 10
             else:
                 iterations = int(iterations)
-            set_(q, zeropower_via_newtonschulz5(m, o[:, sort_idx], iterations))
+            set_(q_local, zeropower_via_newtonschulz5(m_local, o_local[:, sort_idx], iterations))
         else:
-            set_(q, ortho(tmp[:, sort_idx]))
+            # indexing is not an allowed operation for Dtensor
+            set_(q_local, ortho(tmp[:, sort_idx]))
+        
+        # if distriubted we need to copy result to state
+        if isinstance(q, DTensor):
+            q_dist = to_dist(q_local, meta)
+            set_(q, q_dist)
 
-    indices = tuple(slice(None) if ind is None else ind.view(*(1,) * i, -1, *(1,) * (exp_avg_sq.dim() - i - 1))  #
+
+
+    if isinstance(exp_avg_sq, DTensor):
+        exp_avg_sq_local, meta = to_local(exp_avg_sq, keep_sharded=False)
+    else:
+        exp_avg_sq_local = exp_avg_sq
+
+    indices = tuple(slice(None) if ind is None else ind.view(*(1,) * i, -1, *(1,) * (exp_avg_sq_local.dim() - i - 1))  #
                     for i, ind in enumerate(indices))
-    set_(exp_avg_sq, exp_avg_sq[indices])
+    set_(exp_avg_sq_local, exp_avg_sq_local[indices])
+
+    if isinstance(exp_avg_sq, DTensor):
+        exp_avg_sq_dist = to_dist(exp_avg_sq_local, meta)
+        set_(exp_avg_sq, exp_avg_sq_dist)
 
 
 def get_orthogonal_matrix(mat):
@@ -308,7 +392,10 @@ def get_orthogonal_matrix(mat):
             if modifier is not None:
                 m = m.to(modifier)
             try:
-                Q = torch.linalg.eigh(m + 1e-30 * torch.eye(m.shape[0], device=m.device))[1].to(device=device,
+                eye_tensor = torch.eye(m.shape[0], device=device, dtype=dtype)
+                if isinstance(m, DTensor):
+                    eye_tensor = distribute_tensor(eye_tensor, device_mesh=m.device_mesh, placements=m.placements)
+                Q = torch.linalg.eigh(m + 1e-30 * eye_tensor)[1].to(device=device,
                                                                                                 dtype=dtype)
                 break
             except torch.OutOfMemoryError:
@@ -319,7 +406,11 @@ def get_orthogonal_matrix(mat):
         else:
             raise RuntimeError("Failed to compute eigenvalues.")
 
-        Q = torch.flip(Q, [1])
+        # this cannot be done with Dtensor
+        if isinstance(Q, DTensor):
+            Q = local_op(torch.flip, Q, [1])
+        else:
+            Q = torch.flip(Q, [1])
 
         if not float_data:
             Q = Q.to(original_device).type(original_type)
@@ -410,14 +501,20 @@ def init_preconditioner(grad, state, max_precond_dim=10000, precondition_1d=Fals
         if not precondition_1d or grad.shape[0] > max_precond_dim:
             state['GG'].append([])
             return
-        state['GG'].append(torch.zeros(grad.shape[0], grad.shape[0], device=grad.device, dtype=grad.dtype))
+        tensor = torch.zeros(grad.shape[0], grad.shape[0], device=grad.device, dtype=grad.dtype)
+        if isinstance(grad, DTensor):
+            tensor = distribute_tensor(tensor, device_mesh=grad.device_mesh, placements=grad.placements)
+        state['GG'].append(tensor)
         return
 
     for sh in grad.shape:
         if sh > max_precond_dim:
             state['GG'].append([])
         else:
-            state['GG'].append(torch.zeros(sh, sh, device=grad.device, dtype=grad.dtype))
+            tensor = torch.zeros(sh, sh, device=grad.device, dtype=grad.dtype)
+            if isinstance(grad, DTensor):
+                tensor = distribute_tensor(tensor, device_mesh=grad.device_mesh, placements=grad.placements)
+            state['GG'].append(tensor)
 
 
 @decorator
@@ -580,15 +677,17 @@ def copy_stochastic_list_(target: List[torch.Tensor], source: List[torch.Tensor]
     for t, s in zip(target, source):
         copy_stochastic_(t, s)
 
-
-@torch.compile(mode='max-autotune-no-cudagraphs', fullgraph=True, dynamic=True)
+# DISABLING FOR FSDP
+# @torch.compile(mode='max-autotune-no-cudagraphs', fullgraph=True, dynamic=True)
 def _compilable_exp_avg_(exp_avg, exp_avg_sq, grad, grad_projected, beta1, beta2, step):
     beta1 = beta_debias(beta1, step)
     beta2 = beta_debias(beta2, step)
 
     g32, gp32, exp_avg_sq32 = [list(map(promote, x)) for x in [grad, grad_projected, exp_avg_sq]]
 
-    stochastic_lerp_(exp_avg, g32, 1 - beta1)
+    # stochastic_lerp_(exp_avg, g32, 1 - beta1)
+    # exp_avg.lerp_(g32, 1 - beta1)
+    torch._foreach_lerp_(exp_avg, g32, weight=1 - beta1)
     denom = exp_avg_sq_(exp_avg_sq32, gp32, beta2, 1e-8)
 
     copy_stochastic_list_(exp_avg_sq, exp_avg_sq32)

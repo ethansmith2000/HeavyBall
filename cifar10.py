@@ -15,6 +15,16 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed._composable.fsdp import fully_shard
 
+def print_if_master(*args):
+    if torch.distributed.get_rank() == 0:
+        print(*args)
+
+
+torch.distributed.init_process_group(
+    backend="nccl", init_method="env://",
+)
+torch.cuda.set_device(torch.distributed.get_rank())
+
 
 class PreNorm(nn.Module):
     def __init__(self, dim, fn):
@@ -139,10 +149,10 @@ class VIT(nn.Module):
         mlp_mult=4,
         dropout=0.1,
         emb_dropout=0.1,
-        num_classes=1000,
+        num_classes=10,
         in_channels=3,
-        patch_size=16,
-        image_size=224,
+        patch_size=4,
+        image_size=32,
     ):
         super().__init__()
         self.patch_embed = PatchEmbed(
@@ -150,7 +160,7 @@ class VIT(nn.Module):
         )
         dim = head_dim * heads
         self.pos_embs = torch.nn.Parameter(
-            torch.randn(1, (image_size // patch_size) ** 2, head_dim * heads)
+            torch.randn((image_size // patch_size) ** 2, head_dim * heads)
         )
 
         self.transformer = Transformer(
@@ -168,10 +178,8 @@ class VIT(nn.Module):
 
     def forward(self, pixel_values):
         x = self.patch_embed(pixel_values)
-        h = x + self.pos_embs
-        h = self.prepare_for_transformer(h)
-        for layer in self.transformer:
-            h = layer(h)
+        h = x + self.pos_embs.unsqueeze(0)
+        h = self.transformer(h)
         h = self.out_norm(h)
         h = self.pooler(h)
         h = self.proj_out(h)
@@ -186,36 +194,26 @@ transform = transforms.Compose(
 
 batch_size = 4
 
+# hack if you're downloading for first time
+if torch.distributed.get_rank() == 0:
+    trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
+                                            download=True, transform=transform)
+torch.distributed.barrier()
 trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
                                         download=True, transform=transform)
 trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size,
-                                          shuffle=True, num_workers=2)
+                                        shuffle=True, num_workers=2)
 
+if torch.distributed.get_rank() == 0:
+    testset = torchvision.datasets.CIFAR10(root='./data', train=False,
+                                        download=True, transform=transform)
+torch.distributed.barrier()
 testset = torchvision.datasets.CIFAR10(root='./data', train=False,
-                                       download=True, transform=transform)
+                                    download=True, transform=transform)
 testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
-                                         shuffle=False, num_workers=2)
+                                        shuffle=False, num_workers=2)
 
 classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
-
-
-def imshow(img):
-    img = img / 2 + 0.5     # unnormalize
-    npimg = img.numpy()
-    plt.imshow(np.transpose(npimg, (1, 2, 0)))
-    plt.show()
-
-
-# get some random training images
-dataiter = iter(trainloader)
-images, labels = next(dataiter)
-
-# show images
-imshow(torchvision.utils.make_grid(images))
-# print labels
-print(' '.join(f'{classes[labels[j]]:5s}' for j in range(batch_size)))
-
-
 
 net = VIT()
 
@@ -227,9 +225,12 @@ fsdp_config = {
 }
 
 for attn in net.transformer.attentions:
+    print_if_master("Sharding attention")
     fully_shard(attn, **fsdp_config)
 for ffn in net.transformer.ffns:
+    print_if_master("Sharding ffn")
     fully_shard(ffn, **fsdp_config)
+print_if_master("Sharding transformer")
 fully_shard(net, **fsdp_config)
 
 criterion = nn.CrossEntropyLoss()
@@ -238,20 +239,27 @@ optimizer = SOAP(net.parameters(), lr=0.001)
 
 
 for epoch in range(2):  # loop over the dataset multiple times
-
     running_loss = 0.0
     for i, data in enumerate(trainloader, 0):
         # get the inputs; data is a list of [inputs, labels]
         inputs, labels = data
+        inputs = inputs.to("cuda")
+        labels = labels.to("cuda")
+
 
         # zero the parameter gradients
         optimizer.zero_grad()
+        print_if_master("zeroed grad")
 
         # forward + backward + optimize
         outputs = net(inputs)
+        print_if_master("got outputs")
         loss = criterion(outputs, labels)
+        print_if_master("got loss")
         loss.backward()
+        print_if_master("backprop'd")
         optimizer.step()
+        print_if_master("stepped")
 
         # print statistics
         running_loss += loss.item()
